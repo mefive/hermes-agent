@@ -1252,6 +1252,42 @@ class TestResolveMediaCodes:
         assert message.image_content.download_code == "https://oss.example.com/fallback"
 
     @pytest.mark.asyncio
+    async def test_picture_download_code_key_flows_to_media_urls(
+        self, _patch_robot_models
+    ):
+        """Regression: _resolve_media_codes tracks pictureDownloadCode but the
+        old _extract_media only read downloadCode/download_code, so images
+        delivered under that legacy key silently disappeared into "Empty
+        message, skipping" — visible only at DEBUG.  Make sure the round-trip
+        actually surfaces them."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+        adapter._get_access_token = AsyncMock(return_value="tok")
+        adapter._robot_sdk = _make_robot_sdk_stub("https://oss.example.com/p")
+        adapter._download_media_to_cache = AsyncMock(return_value="/cache/legacy.png")
+
+        rich_list = [
+            {"type": "picture", "pictureDownloadCode": "dc_legacy"},
+        ]
+        message = SimpleNamespace(
+            image_content=None,
+            rich_text_content=SimpleNamespace(rich_text_list=rich_list),
+            robot_code="rc",
+            message_type="richText",
+        )
+
+        await adapter._resolve_media_codes(message)
+        msg_type, urls, types = adapter._extract_media(message)
+
+        assert urls == ["/cache/legacy.png"]
+        assert types == ["image"]
+
+    @pytest.mark.asyncio
     async def test_extract_media_sees_local_paths_after_resolve(
         self, _patch_robot_models
     ):

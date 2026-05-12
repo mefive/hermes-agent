@@ -587,7 +587,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         """Process an incoming DingTalk chatbot message."""
         msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
         if self._dedup.is_duplicate(msg_id):
-            logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
+            logger.info("[%s] Duplicate message %s, skipping", self.name, msg_id)
             return
 
         # Chat context
@@ -603,7 +603,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         # Allowed-users gate (applies to both DM and group)
         if not self._is_user_allowed(sender_id, sender_staff_id):
-            logger.debug(
+            logger.info(
                 "[%s] Dropping message from non-allowlisted user staff_id=%s sender_id=%s",
                 self.name, sender_staff_id, sender_id,
             )
@@ -615,7 +615,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # gate decides whether to process.
         _early_text = self._extract_text(message) or ""
         if not self._should_process_message(message, _early_text, is_group, chat_id):
-            logger.debug(
+            logger.info(
                 "[%s] Dropping group message that failed mention gate message_id=%s chat_id=%s",
                 self.name, msg_id, chat_id,
             )
@@ -655,7 +655,13 @@ class DingTalkAdapter(BasePlatformAdapter):
         msg_type, media_urls, media_types = self._extract_media(message)
 
         if not text and not media_urls:
-            logger.debug("[%s] Empty message, skipping", self.name)
+            logger.info(
+                "[%s] Empty message after media extraction, skipping message_id=%s "
+                "(image_content=%s rich_text_items=%s)",
+                self.name, msg_id,
+                getattr(message, "image_content", None) is not None,
+                len(getattr(getattr(message, "rich_text_content", None), "rich_text_list", []) or []),
+            )
             return
 
         source = self.build_source(
@@ -769,8 +775,15 @@ class DingTalkAdapter(BasePlatformAdapter):
             if isinstance(rich_list, list):
                 for item in rich_list:
                     if isinstance(item, dict):
+                        # Keep this key list in sync with _resolve_media_codes —
+                        # any key resolved upstream must also be read here, or
+                        # the picked-up local path never reaches media_urls and
+                        # the message is silently dropped as "empty".
                         dl_code = (
-                            item.get("downloadCode") or item.get("download_code") or ""
+                            item.get("downloadCode")
+                            or item.get("pictureDownloadCode")
+                            or item.get("download_code")
+                            or ""
                         )
                         item_type = item.get("type", "")
                         if dl_code:
@@ -1606,7 +1619,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             local_path = await self._download_media_to_cache(url, kind, obj)
             replacement = local_path or url
             if local_path:
-                logger.debug(
+                logger.info(
                     "[%s] Cached inbound %s media at %s", self.name, kind, local_path,
                 )
             else:
