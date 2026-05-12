@@ -109,6 +109,37 @@ _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
 DINGTALK_TYPE_MAPPING = {
     "picture": "image",
     "voice": "audio",
+    "video": "video",
+    "file": "file",
+}
+
+# Content-Type → extension for media we receive from DingTalk's OSS CDN.
+# Used when caching bytes locally so vision/STT tools see a sensible suffix.
+_IMAGE_CT_EXT = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+}
+_AUDIO_CT_EXT = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".ogg",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/amr": ".amr",
+}
+_VIDEO_CT_EXT = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
 }
 
 
@@ -1476,48 +1507,75 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
 
     async def _resolve_media_codes(self, message: "ChatbotMessage") -> None:
-        """Resolve download codes in message to actual URLs."""
+        """Resolve download codes to local file paths.
+
+        DingTalk's robot API returns a short-lived signed OSS URL for each
+        download code.  We follow that URL, download the bytes, and stage
+        them in the shared media cache so vision/STT/document tools (which
+        only accept local paths — see ``MessageEvent.media_urls`` at
+        gateway/platforms/base.py:943) can use the attachment directly.
+        """
         token = await self._get_access_token()
         if not token:
             return
 
         robot_code = getattr(message, "robot_code", None) or self._client_id
-        codes_to_resolve = []
+        # Each entry: (obj, key, kind) where kind ∈ {"image","audio","video","file"}
+        codes_to_resolve: List[tuple[Any, str, str]] = []
 
-        # Collect codes and references to update
-        # 1. Single image content
+        # 1. Single image content — always an image.
         img_content = getattr(message, "image_content", None)
         if img_content and getattr(img_content, "download_code", None):
-            codes_to_resolve.append((img_content, "download_code"))
+            codes_to_resolve.append((img_content, "download_code", "image"))
 
-        # 2. Rich text list
+        # 2. Rich text list — kind depends on the item's declared type.
         rich_text = getattr(message, "rich_text_content", None)
         if rich_text:
             rich_list = getattr(rich_text, "rich_text_list", []) or []
             for item in rich_list:
                 if isinstance(item, dict):
+                    kind = self._kind_for_richtext_item(item.get("type", ""))
                     for key in ("downloadCode", "pictureDownloadCode", "download_code"):
                         if item.get(key):
-                            codes_to_resolve.append((item, key))
+                            codes_to_resolve.append((item, key, kind))
 
         if not codes_to_resolve:
             return
 
-        # Resolve all codes in parallel
+        # Resolve and download in parallel.
         tasks = []
-        for obj, key in codes_to_resolve:
+        for obj, key, kind in codes_to_resolve:
             code = getattr(obj, key, None) if hasattr(obj, key) else obj.get(key)
             if code:
                 tasks.append(
-                    self._fetch_download_url(code, robot_code, token, obj, key)
+                    self._fetch_download_url(code, robot_code, token, obj, key, kind)
                 )
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    @staticmethod
+    def _kind_for_richtext_item(item_type: str) -> str:
+        """Map a rich-text item ``type`` to one of image/audio/video/file."""
+        mapped = DINGTALK_TYPE_MAPPING.get(item_type, item_type or "file")
+        if mapped in {"image", "audio", "video"}:
+            return mapped
+        return "file"
+
     async def _fetch_download_url(
-        self, code: str, robot_code: str, token: str, obj, key: str
+        self,
+        code: str,
+        robot_code: str,
+        token: str,
+        obj,
+        key: str,
+        kind: str,
     ) -> None:
-        """Fetch download URL for a single code using the robot SDK."""
+        """Resolve a download code and stage the bytes in the local cache.
+
+        On success ``obj[key]`` is rewritten to the absolute local path so
+        ``_extract_media`` picks it up unchanged.  On failure we fall back to
+        the OSS URL — the agent can still ``curl`` it explicitly if needed.
+        """
         if not self._robot_sdk:
             logger.warning(
                 "[%s] Robot SDK not initialized, cannot resolve media code",
@@ -1537,21 +1595,100 @@ class DingTalkAdapter(BasePlatformAdapter):
                 request, headers, runtime
             )
             body = response.body if response else None
-            if body:
-                url = getattr(body, "download_url", None)
-                if url:
-                    if hasattr(obj, key):
-                        setattr(obj, key, url)
-                    elif isinstance(obj, dict):
-                        obj[key] = url
+            url = getattr(body, "download_url", None) if body else None
+            if not url:
+                logger.warning(
+                    "[%s] Failed to resolve media: empty response for code %s",
+                    self.name, code,
+                )
+                return
+
+            local_path = await self._download_media_to_cache(url, kind, obj)
+            replacement = local_path or url
+            if local_path:
+                logger.debug(
+                    "[%s] Cached inbound %s media at %s", self.name, kind, local_path,
+                )
             else:
                 logger.warning(
-                    "[%s] Failed to download media: empty response for code %s",
-                    self.name,
-                    code,
+                    "[%s] Falling back to OSS URL for %s media (cache miss)",
+                    self.name, kind,
                 )
+            if hasattr(obj, key):
+                setattr(obj, key, replacement)
+            elif isinstance(obj, dict):
+                obj[key] = replacement
         except Exception as e:
             logger.error("[%s] Error resolving media code %s: %s", self.name, code, e)
+
+    async def _download_media_to_cache(
+        self, url: str, kind: str, obj: Any
+    ) -> Optional[str]:
+        """Fetch *url* and persist the bytes in the shared media cache.
+
+        Returns the absolute local path on success, or ``None`` if either the
+        download or the local write failed.  Callers decide the fallback.
+        """
+        if not HTTPX_AVAILABLE:
+            return None
+        try:
+            async with httpx.AsyncClient(
+                timeout=30.0, follow_redirects=True,
+            ) as client:
+                resp = await client.get(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.content
+                content_type = (
+                    resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                )
+        except Exception as e:
+            logger.warning(
+                "[%s] Failed to download DingTalk media bytes: %s", self.name, e,
+            )
+            return None
+
+        if not data:
+            return None
+
+        from gateway.platforms.base import (
+            cache_audio_from_bytes,
+            cache_document_from_bytes,
+            cache_image_from_bytes,
+            cache_video_from_bytes,
+        )
+
+        try:
+            if kind == "image":
+                ext = _IMAGE_CT_EXT.get(content_type, ".jpg")
+                return cache_image_from_bytes(data, ext=ext)
+            if kind == "audio":
+                ext = _AUDIO_CT_EXT.get(content_type, ".mp3")
+                return cache_audio_from_bytes(data, ext=ext)
+            if kind == "video":
+                ext = _VIDEO_CT_EXT.get(content_type, ".mp4")
+                return cache_video_from_bytes(data, ext=ext)
+            # File: prefer the original DingTalk-supplied filename when present.
+            filename = ""
+            if isinstance(obj, dict):
+                for hint_key in ("fileName", "file_name", "name"):
+                    raw = obj.get(hint_key)
+                    if isinstance(raw, str) and raw.strip():
+                        filename = raw.strip()
+                        break
+            if not filename:
+                guessed = mimetypes.guess_extension(content_type) if content_type else None
+                filename = f"file{guessed or '.bin'}"
+            return cache_document_from_bytes(data, filename=filename)
+        except Exception as e:
+            logger.warning(
+                "[%s] Failed to write DingTalk media to cache: %s", self.name, e,
+            )
+            return None
 
     @staticmethod
     def _normalize_markdown(text: str) -> str:

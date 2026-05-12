@@ -249,24 +249,116 @@ class TestSend:
         assert payload["markdown"]["text"] == "Screenshot\n\n![image](https://example.com/demo.png)"
 
     @pytest.mark.asyncio
-    async def test_send_image_file_returns_explicit_unsupported_error(self):
+    async def test_send_image_file_errors_when_file_missing(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
-        result = await adapter.send_image_file("chat-123", "/tmp/demo.png")
+        result = await adapter.send_image_file(
+            "chat-123", "/tmp/this-path-does-not-exist.png"
+        )
 
         assert result.success is False
-        assert result.error and "do not support local image uploads" in result.error
+        assert result.error and "File not found" in result.error
 
     @pytest.mark.asyncio
-    async def test_send_document_returns_explicit_unsupported_error(self):
+    async def test_send_document_errors_when_file_missing(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
-        result = await adapter.send_document("chat-123", "/tmp/demo.pdf")
+        result = await adapter.send_document(
+            "chat-123", "/tmp/this-path-does-not-exist.pdf"
+        )
 
         assert result.success is False
-        assert result.error and "do not support local file attachments" in result.error
+        assert result.error and "File not found" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_uploads_and_sends_via_robot_api(self, tmp_path):
+        """Happy path: real file → media/upload → oToMessages/batchSend."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import SendResult
+
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = AsyncMock()
+        adapter._get_access_token = AsyncMock(return_value="tok")
+        adapter._close_streaming_siblings = AsyncMock()
+        adapter._upload_media = AsyncMock(return_value="media_abc")
+        adapter._robot_send_template = AsyncMock(
+            return_value=SendResult(success=True, message_id="msg_42")
+        )
+        adapter._message_contexts["chat-123"] = SimpleNamespace(
+            conversation_type="1",
+            conversation_id="chat-123",
+            sender_staff_id="staff-x",
+        )
+
+        result = await adapter.send_image_file("chat-123", str(image_path))
+
+        assert result.success is True
+        assert result.message_id == "msg_42"
+        adapter._upload_media.assert_awaited_once()
+        upload_args = adapter._upload_media.await_args
+        assert upload_args.args[0] == image_path
+        assert upload_args.args[1] == "image"
+        send_args = adapter._robot_send_template.await_args
+        assert send_args.kwargs["msg_key"] == "sampleImageMsg"
+        assert send_args.kwargs["msg_param"] == {"photoURL": "media_abc"}
+
+    @pytest.mark.asyncio
+    async def test_send_document_builds_filetype_from_suffix(self, tmp_path):
+        """sampleFile requires {mediaId, fileName, fileType} — verify the
+        builder pulls fileType from the path suffix and forwards file_name."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import SendResult
+
+        doc_path = tmp_path / "Q3-report.PDF"
+        doc_path.write_bytes(b"%PDF-1.4\n")
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = AsyncMock()
+        adapter._get_access_token = AsyncMock(return_value="tok")
+        adapter._close_streaming_siblings = AsyncMock()
+        adapter._upload_media = AsyncMock(return_value="media_pdf")
+        adapter._robot_send_template = AsyncMock(
+            return_value=SendResult(success=True, message_id="msg_99")
+        )
+        adapter._message_contexts["chat-456"] = SimpleNamespace(
+            conversation_type="1",
+            conversation_id="chat-456",
+            sender_staff_id="staff-y",
+        )
+
+        result = await adapter.send_document("chat-456", str(doc_path))
+
+        assert result.success is True
+        send_args = adapter._robot_send_template.await_args
+        assert send_args.kwargs["msg_key"] == "sampleFile"
+        msg_param = send_args.kwargs["msg_param"]
+        assert msg_param["mediaId"] == "media_pdf"
+        assert msg_param["fileName"] == "Q3-report.PDF"
+        # Suffix should be normalized lowercase, without the leading dot.
+        assert msg_param["fileType"] == "pdf"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_errors_without_message_context(self, tmp_path):
+        """DingTalk replies need a captured inbound ChatbotMessage; without one
+        the robot send APIs have no conversation to target."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = AsyncMock()
+        # No _message_contexts entry for this chat.
+
+        result = await adapter.send_image_file("chat-unknown", str(image_path))
+
+        assert result.success is False
+        assert result.error and "No inbound message context" in result.error
 
 
 # ---------------------------------------------------------------------------
@@ -1013,3 +1105,347 @@ class TestDingTalkAdapterAICards:
         mock_card_sdk.deliver_card_with_options_async.assert_called_once()
         mock_card_sdk.streaming_update_with_options_async.assert_called_once()
         assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# Inbound media: resolve download codes → cache bytes locally
+# ---------------------------------------------------------------------------
+
+
+class TestKindForRichTextItem:
+    """Mapping from rich-text item ``type`` to internal media kind."""
+
+    def test_picture_is_image(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._kind_for_richtext_item("picture") == "image"
+
+    def test_voice_is_audio(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._kind_for_richtext_item("voice") == "audio"
+
+    def test_video_is_video(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._kind_for_richtext_item("video") == "video"
+
+    def test_file_is_file(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._kind_for_richtext_item("file") == "file"
+
+    def test_unknown_defaults_to_file(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._kind_for_richtext_item("") == "file"
+        assert DingTalkAdapter._kind_for_richtext_item("widget") == "file"
+
+
+def _make_robot_sdk_stub(download_url: str | None):
+    """Return a fake _robot_sdk whose download call yields *download_url*."""
+    body = SimpleNamespace(download_url=download_url) if download_url else None
+    response = SimpleNamespace(body=body)
+    sdk = MagicMock()
+    sdk.robot_message_file_download_with_options_async = AsyncMock(return_value=response)
+    return sdk
+
+
+@pytest.fixture
+def _patch_robot_models(monkeypatch):
+    """Stub the alibabacloud model classes so the SDK isn't required for unit tests."""
+    fake_models = SimpleNamespace(
+        RobotMessageFileDownloadRequest=lambda **kw: SimpleNamespace(**kw),
+        RobotMessageFileDownloadHeaders=lambda **kw: SimpleNamespace(**kw),
+    )
+    fake_tea = SimpleNamespace(RuntimeOptions=lambda: SimpleNamespace())
+    monkeypatch.setattr("gateway.platforms.dingtalk.dingtalk_robot_models", fake_models)
+    monkeypatch.setattr("gateway.platforms.dingtalk.tea_util_models", fake_tea)
+
+
+class TestResolveMediaCodes:
+    """End-to-end behaviour of _resolve_media_codes against mocked DingTalk SDK."""
+
+    @pytest.mark.asyncio
+    async def test_image_content_download_code_replaced_with_local_path(
+        self, _patch_robot_models
+    ):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+        adapter._get_access_token = AsyncMock(return_value="tok")
+        adapter._robot_sdk = _make_robot_sdk_stub("https://oss.example.com/sig")
+        adapter._download_media_to_cache = AsyncMock(return_value="/cache/img.jpg")
+
+        message = SimpleNamespace(
+            image_content=SimpleNamespace(download_code="dc_abc"),
+            rich_text_content=None,
+            robot_code="robotX",
+        )
+
+        await adapter._resolve_media_codes(message)
+
+        assert message.image_content.download_code == "/cache/img.jpg"
+        adapter._download_media_to_cache.assert_awaited_once_with(
+            "https://oss.example.com/sig", "image", message.image_content,
+        )
+
+    @pytest.mark.asyncio
+    async def test_rich_text_items_carry_correct_kind(self, _patch_robot_models):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+        adapter._get_access_token = AsyncMock(return_value="tok")
+        adapter._robot_sdk = _make_robot_sdk_stub("https://oss.example.com/x")
+
+        # Return distinct paths per kind so we can verify the rewrite.
+        async def _cache(url, kind, obj):
+            return f"/cache/{kind}.bin"
+
+        adapter._download_media_to_cache = AsyncMock(side_effect=_cache)
+
+        rich_list = [
+            {"type": "picture", "downloadCode": "dc_pic"},
+            {"type": "voice", "downloadCode": "dc_aud"},
+            {"type": "file", "downloadCode": "dc_doc", "fileName": "report.pdf"},
+        ]
+        message = SimpleNamespace(
+            image_content=None,
+            rich_text_content=SimpleNamespace(rich_text_list=rich_list),
+            robot_code=None,
+        )
+
+        await adapter._resolve_media_codes(message)
+
+        assert rich_list[0]["downloadCode"] == "/cache/image.bin"
+        assert rich_list[1]["downloadCode"] == "/cache/audio.bin"
+        assert rich_list[2]["downloadCode"] == "/cache/file.bin"
+        # Verify kind propagation, not just paths.
+        kinds_passed = [call.args[1] for call in adapter._download_media_to_cache.await_args_list]
+        assert kinds_passed == ["image", "audio", "file"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_oss_url_when_cache_fails(self, _patch_robot_models):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+        adapter._get_access_token = AsyncMock(return_value="tok")
+        adapter._robot_sdk = _make_robot_sdk_stub("https://oss.example.com/fallback")
+        adapter._download_media_to_cache = AsyncMock(return_value=None)
+
+        message = SimpleNamespace(
+            image_content=SimpleNamespace(download_code="dc_xyz"),
+            rich_text_content=None,
+            robot_code="robotZ",
+        )
+
+        await adapter._resolve_media_codes(message)
+
+        # When local cache fails, agent at least gets the (short-lived) URL.
+        assert message.image_content.download_code == "https://oss.example.com/fallback"
+
+    @pytest.mark.asyncio
+    async def test_extract_media_sees_local_paths_after_resolve(
+        self, _patch_robot_models
+    ):
+        """Smoke-test the integration: _extract_media must surface local paths
+        in media_urls so downstream consumers (run.py:6707) get the path they
+        expect by convention."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+        adapter._get_access_token = AsyncMock(return_value="tok")
+        adapter._robot_sdk = _make_robot_sdk_stub("https://oss.example.com/y")
+        adapter._download_media_to_cache = AsyncMock(return_value="/cache/photo.png")
+
+        message = SimpleNamespace(
+            image_content=SimpleNamespace(download_code="dc_pic"),
+            rich_text_content=None,
+            robot_code="rc",
+            message_type="picture",
+        )
+
+        await adapter._resolve_media_codes(message)
+        msg_type, urls, types = adapter._extract_media(message)
+        assert urls == ["/cache/photo.png"]
+        assert types == ["image"]
+
+    @pytest.mark.asyncio
+    async def test_skips_when_no_access_token(self, _patch_robot_models):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+        adapter._get_access_token = AsyncMock(return_value=None)
+        adapter._robot_sdk = MagicMock()
+        adapter._download_media_to_cache = AsyncMock()
+
+        message = SimpleNamespace(
+            image_content=SimpleNamespace(download_code="dc_x"),
+            rich_text_content=None,
+            robot_code="rc",
+        )
+
+        await adapter._resolve_media_codes(message)
+
+        # No SDK call, no rewrite — the original code stays in place.
+        assert message.image_content.download_code == "dc_x"
+        adapter._download_media_to_cache.assert_not_awaited()
+
+
+class TestDownloadMediaToCache:
+    """Verify the bytes-to-disk path picks the right cache and extension."""
+
+    @pytest.mark.asyncio
+    async def test_image_routes_to_image_cache_with_content_type_ext(
+        self, monkeypatch
+    ):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+
+        # Fake httpx context manager that yields a client returning PNG bytes.
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+        class _FakeResp:
+            content = png_bytes
+            headers = {"Content-Type": "image/png; charset=binary"}
+
+            def raise_for_status(self):
+                return None
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                return _FakeResp()
+
+        monkeypatch.setattr("gateway.platforms.dingtalk.HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            "gateway.platforms.dingtalk.httpx",
+            SimpleNamespace(AsyncClient=lambda **kw: _FakeClient()),
+        )
+
+        captured = {}
+
+        def _fake_cache_image(data, ext=".jpg"):
+            captured["data"] = data
+            captured["ext"] = ext
+            return f"/cache/images/img_test{ext}"
+
+        monkeypatch.setattr(
+            "gateway.platforms.base.cache_image_from_bytes", _fake_cache_image
+        )
+
+        path = await adapter._download_media_to_cache(
+            "https://oss.example.com/x", "image", obj=None,
+        )
+
+        assert path == "/cache/images/img_test.png"
+        assert captured["data"] == png_bytes
+        assert captured["ext"] == ".png"
+
+    @pytest.mark.asyncio
+    async def test_file_uses_dingtalk_filename_hint(self, monkeypatch):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+
+        class _FakeResp:
+            content = b"PDF-DATA"
+            headers = {"Content-Type": "application/pdf"}
+
+            def raise_for_status(self):
+                return None
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                return _FakeResp()
+
+        monkeypatch.setattr("gateway.platforms.dingtalk.HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            "gateway.platforms.dingtalk.httpx",
+            SimpleNamespace(AsyncClient=lambda **kw: _FakeClient()),
+        )
+
+        captured = {}
+
+        def _fake_cache_doc(data, filename):
+            captured["filename"] = filename
+            return f"/cache/documents/doc_xyz_{filename}"
+
+        monkeypatch.setattr(
+            "gateway.platforms.base.cache_document_from_bytes", _fake_cache_doc
+        )
+
+        path = await adapter._download_media_to_cache(
+            "https://oss.example.com/f",
+            "file",
+            obj={"fileName": "Q3-report.pdf", "downloadCode": "dc"},
+        )
+
+        assert path == "/cache/documents/doc_xyz_Q3-report.pdf"
+        assert captured["filename"] == "Q3-report.pdf"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_http_failure(self, monkeypatch):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "id", "client_secret": "secret"},
+        )
+        adapter = DingTalkAdapter(config)
+
+        class _BoomClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                raise RuntimeError("network down")
+
+        monkeypatch.setattr("gateway.platforms.dingtalk.HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            "gateway.platforms.dingtalk.httpx",
+            SimpleNamespace(AsyncClient=lambda **kw: _BoomClient()),
+        )
+
+        path = await adapter._download_media_to_cache(
+            "https://oss.example.com/x", "image", obj=None,
+        )
+        assert path is None
