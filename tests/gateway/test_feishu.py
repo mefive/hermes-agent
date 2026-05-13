@@ -4368,6 +4368,10 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter._resolve_source_chat_type = Mock(return_value="group")
         adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
         adapter._dispatch_inbound_event = AsyncMock()
+        # Pre-mention buffer attrs: 0 = disabled, matches pre-buffer behavior.
+        adapter._context_window = 0
+        adapter._context_max_age = 600.0
+        adapter._group_rules = {}
         return adapter
 
     def test_leading_self_mention_stripped_for_command(self):
@@ -4658,6 +4662,10 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         adapter._resolve_source_chat_type = Mock(return_value="group")
         adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
         adapter._dispatch_inbound_event = AsyncMock()
+        # Pre-mention buffer attrs: 0 = disabled, matches pre-buffer behavior.
+        adapter._context_window = 0
+        adapter._context_max_age = 600.0
+        adapter._group_rules = {}
         return adapter
 
     def _run(self, adapter, text, mentions):

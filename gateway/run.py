@@ -6825,6 +6825,12 @@ class GatewayRunner:
             reply_snippet = event.reply_to_text[:500]
             message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
+        if getattr(event, "recent_context", None):
+            # Pre-mention conversation captured by the adapter's ring buffer.
+            # Placed before reply_to_text so the explicit reply anchor stays
+            # closest to the user's @ message.
+            message_text = f"{event.recent_context}\n\n{message_text}"
+
         if "@" in message_text:
             try:
                 from agent.context_references import preprocess_context_references_async

@@ -59,9 +59,9 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Sequence
@@ -393,6 +393,12 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    # Ring-buffer that captures non-@ group messages so the agent sees recent
+    # context when the bot is eventually summoned. 0 = disabled (default).
+    # Requires the app to hold the im:message.group_msg scope; without it
+    # Feishu never delivers non-@ messages and the buffer stays empty.
+    context_window: int = 0
+    context_max_age_seconds: int = 600
 
 
 @dataclass
@@ -403,6 +409,7 @@ class FeishuGroupRule:
     allowlist: set[str] = field(default_factory=set)
     blacklist: set[str] = field(default_factory=set)
     require_mention: Optional[bool] = None  # None = inherit global
+    context_window: Optional[int] = None  # None = inherit global
 
 
 @dataclass
@@ -410,6 +417,25 @@ class FeishuBatchState:
     events: Dict[str, MessageEvent] = field(default_factory=dict)
     tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class BufferedContext:
+    """One non-@ group message captured for the pre-mention context buffer.
+
+    Lighter than ``MessageEvent`` — drops the raw SDK payload, keeps only what
+    the prompt prefix and media plumbing actually need.
+    """
+
+    message_id: str
+    chat_id: str
+    sender_name: str
+    sender_user_id: str
+    text: str
+    media_paths: List[str]
+    media_types: List[str]
+    timestamp: datetime
+    is_bot: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +565,25 @@ def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -
 def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     parsed = _coerce_int(value, default=default, min_value=min_value)
     return default if parsed is None else parsed
+
+
+def _format_relative_age(delta: timedelta) -> str:
+    """Format a positive ``timedelta`` as a short ``"42s ago"`` / ``"3m ago"``.
+
+    Used by the pre-mention context buffer to render per-message timestamps
+    inside the prompt prefix. Negative deltas (future timestamps) collapse to
+    ``"just now"``.
+    """
+    seconds = int(delta.total_seconds())
+    if seconds <= 0:
+        return "just now"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    return f"{hours}h ago"
 
 
 # ---------------------------------------------------------------------------
@@ -1410,6 +1455,18 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        # Pre-mention ring buffer: per-chat deque of recent non-@ messages.
+        # Created lazily per chat_id with maxlen = effective context_window.
+        # Read at @-time, then consumed entries are popped so the next @ won't
+        # re-inject the same snippet.
+        self._context_buffer: Dict[str, "deque[BufferedContext]"] = {}
+        self._context_buffer_lock = asyncio.Lock()
+        # Permission-detection telemetry. Flipped to True the first time a
+        # non-@ group message actually reaches _buffer_inbound — proof that
+        # im:message.group_msg is granted. _context_window_warning_scheduled
+        # keeps the 30-min absence check single-shot.
+        self._context_window_observed = False
+        self._context_window_warning_scheduled = False
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1426,11 +1483,21 @@ class FeishuAdapter(BasePlatformAdapter):
                 per_chat_require_mention: Optional[bool] = None
                 if "require_mention" in rule_cfg:
                     per_chat_require_mention = _to_boolean(rule_cfg.get("require_mention"))
+                per_chat_context_window: Optional[int] = None
+                if "context_window" in rule_cfg:
+                    try:
+                        per_chat_context_window = max(0, int(rule_cfg.get("context_window")))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "[Feishu] Ignoring non-integer context_window for chat %s: %r",
+                            chat_id, rule_cfg.get("context_window"),
+                        )
                 group_rules[str(chat_id)] = FeishuGroupRule(
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
                     allowlist={str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()},
                     blacklist={str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()},
                     require_mention=per_chat_require_mention,
+                    context_window=per_chat_context_window,
                 )
 
         # Bot-level admins
@@ -1510,6 +1577,25 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            context_window=max(
+                0,
+                _coerce_required_int(
+                    extra.get("context_window", os.getenv("FEISHU_CONTEXT_WINDOW", "0")),
+                    default=0,
+                    min_value=0,
+                ),
+            ),
+            context_max_age_seconds=max(
+                1,
+                _coerce_required_int(
+                    extra.get(
+                        "context_max_age_seconds",
+                        os.getenv("FEISHU_CONTEXT_MAX_AGE_SECONDS", "600"),
+                    ),
+                    default=600,
+                    min_value=1,
+                ),
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1542,6 +1628,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._context_window = settings.context_window
+        self._context_max_age = float(settings.context_max_age_seconds)
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -2355,6 +2443,14 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         reason = self._admit(sender, message)
+        chat_id_for_window = getattr(message, "chat_id", "") or ""
+        if reason == "group_policy_rejected" and self._context_window_for(chat_id_for_window) > 0:
+            # Non-@ group message that would normally be dropped — capture into
+            # the ring buffer so a later @ in the same chat sees recent context.
+            # Other reject reasons (self_echo, bots_disabled, allow_users) keep
+            # dropping silently.
+            await self._buffer_inbound(data, message, sender)
+            return
         if reason is not None:
             logger.debug("[Feishu] dropping inbound event: %s", reason)
             return
@@ -2970,6 +3066,21 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
+        recent_context: Optional[str] = None
+        if self._context_window_for(chat_id) > 0 and chat_type != "p2p":
+            self._maybe_schedule_context_window_check()
+            prefix, ctx_paths, ctx_types = await self._consume_context(
+                chat_id=chat_id,
+                until_ts=datetime.now(),
+            )
+            if prefix:
+                recent_context = prefix
+                # Buffered images precede the @ message's own attachments so
+                # the timeline reads naturally (older → newer) when the agent
+                # iterates vision input.
+                media_urls = list(ctx_paths) + list(media_urls)
+                media_types = list(ctx_types) + list(media_types)
+
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
@@ -2980,6 +3091,7 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            recent_context=recent_context,
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -3933,6 +4045,207 @@ class FeishuAdapter(BasePlatformAdapter):
         if rule and rule.require_mention is not None:
             return rule.require_mention
         return self._require_mention
+
+    def _context_window_for(self, chat_id: str) -> int:
+        """Resolve the effective pre-mention buffer size for *chat_id*.
+
+        Per-chat override wins when present; otherwise the global setting.
+        """
+        rule = self._group_rules.get(chat_id) if chat_id else None
+        if rule and rule.context_window is not None:
+            return max(0, rule.context_window)
+        return max(0, self._context_window)
+
+    # --- Pre-mention context buffer ------------------------------------------
+
+    async def _buffer_inbound(self, data: Any, message: Any, sender: Any) -> None:
+        """Capture a non-@ group message into the per-chat ring buffer.
+
+        Reuses :meth:`_extract_message_content` so text and image extraction
+        match what :meth:`_process_inbound_message` would have produced. Skips
+        bot senders, empty payloads, and commands — none of which are useful
+        as conversational context. Non-image media (audio/video/document) is
+        also dropped from the buffer entry to keep v1 focused on text+image.
+        """
+        message_id = str(getattr(message, "message_id", "") or "")
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        if not chat_id:
+            return
+
+        is_bot = _is_bot_sender(sender)
+        if is_bot:
+            return  # Don't pollute context with bot chatter.
+
+        sender_id_obj = getattr(sender, "sender_id", None)
+        try:
+            text, inbound_type, media_urls, media_types, _mentions = (
+                await self._extract_message_content(message)
+            )
+        except Exception:
+            logger.debug(
+                "[Feishu] context_buffer: extraction failed for %s",
+                message_id, exc_info=True,
+            )
+            return
+
+        if inbound_type == MessageType.COMMAND:
+            return
+        if text and text.startswith("/"):
+            return
+
+        # Keep only image attachments in the buffer entry; vision is the only
+        # media modality the prompt prefix can usefully reference today.
+        kept_paths: List[str] = []
+        kept_types: List[str] = []
+        for path, mtype in zip(media_urls, media_types):
+            if mtype and mtype.lower().startswith("image/"):
+                kept_paths.append(path)
+                kept_types.append(mtype)
+
+        if not text and not kept_paths:
+            return
+
+        sender_profile = await self._resolve_sender_profile(sender_id_obj, is_bot=False)
+        entry = BufferedContext(
+            message_id=message_id,
+            chat_id=chat_id,
+            sender_name=sender_profile.get("user_name") or "Unknown",
+            sender_user_id=sender_profile.get("user_id") or "",
+            text=text or "",
+            media_paths=kept_paths,
+            media_types=kept_types,
+            timestamp=datetime.now(),
+            is_bot=False,
+        )
+
+        window = self._context_window_for(chat_id)
+        async with self._context_buffer_lock:
+            buf = self._context_buffer.get(chat_id)
+            if buf is None or buf.maxlen != window:
+                # First message in this chat, or window resized via reload.
+                # Re-seat the deque so maxlen matches the current config.
+                seed = list(buf) if buf else []
+                buf = deque(seed[-window:] if window else [], maxlen=window)
+                self._context_buffer[chat_id] = buf
+            buf.append(entry)
+
+        if not self._context_window_observed:
+            self._context_window_observed = True
+            logger.info(
+                "[Feishu] context_window observation active — receiving non-@ "
+                "group messages (im:message.group_msg scope verified)"
+            )
+
+    async def _consume_context(
+        self,
+        *,
+        chat_id: str,
+        until_ts: datetime,
+    ) -> tuple[Optional[str], List[str], List[str]]:
+        """Drain pre-mention buffer for *chat_id*, return prefix + image media.
+
+        Items at-or-after ``until_ts`` are left in place (defensive — they
+        usually arrived *after* the current @ in burst scenarios). Items older
+        than ``_context_max_age`` are dropped without injection.
+
+        Returns ``(prefix_text, image_paths, image_media_types)``. ``prefix_text``
+        is ``None`` when nothing qualifies, so callers can leave
+        ``MessageEvent.recent_context`` as ``None``.
+        """
+        if not chat_id:
+            return None, [], []
+
+        async with self._context_buffer_lock:
+            buf = self._context_buffer.get(chat_id)
+            if not buf:
+                return None, [], []
+            consumed: List[BufferedContext] = []
+            remaining: List[BufferedContext] = []
+            for entry in buf:
+                if entry.timestamp >= until_ts:
+                    remaining.append(entry)
+                else:
+                    consumed.append(entry)
+            buf.clear()
+            buf.extend(remaining)
+
+        if not consumed:
+            return None, [], []
+
+        # Drop stale-by-TTL items now; we already removed them from the deque
+        # above (consume-once), so they will not re-inject on the next @.
+        fresh: List[BufferedContext] = []
+        for entry in consumed:
+            age = (until_ts - entry.timestamp).total_seconds()
+            if age <= self._context_max_age:
+                fresh.append(entry)
+        if not fresh:
+            return None, [], []
+
+        image_paths: List[str] = []
+        image_types: List[str] = []
+        lines: List[str] = []
+        image_counter = 0
+        for entry in fresh:
+            ago = _format_relative_age(until_ts - entry.timestamp)
+            speaker = entry.sender_name or entry.sender_user_id or "Unknown"
+            body_parts: List[str] = []
+            if entry.text:
+                # Single-line snippet; collapse internal newlines so the prefix
+                # block stays readable to the LLM.
+                snippet = entry.text.strip().replace("\n", " ")
+                if len(snippet) > 240:
+                    snippet = snippet[:240] + "…"
+                body_parts.append(snippet)
+            for path, mtype in zip(entry.media_paths, entry.media_types):
+                image_counter += 1
+                body_parts.append(f"[image {image_counter} attached]")
+                image_paths.append(path)
+                image_types.append(mtype)
+            line_body = " ".join(body_parts) if body_parts else "(empty)"
+            lines.append(f"  {speaker} {ago}: {line_body}")
+
+        prefix = (
+            f"[Recent group context — {len(fresh)} message"
+            f"{'s' if len(fresh) != 1 else ''} before you were @-mentioned:\n"
+            + "\n".join(lines)
+            + "]"
+        )
+        return prefix, image_paths, image_types
+
+    def _maybe_schedule_context_window_check(self) -> None:
+        """Arm a one-shot 30-min check that warns if the buffer stayed empty.
+
+        Called the first time the bot is @-mentioned in a group with
+        ``context_window`` enabled. If no non-@ message has been observed by
+        then, the app almost certainly lacks the ``im:message.group_msg``
+        scope — Feishu does not surface that as an error, just as silence.
+        """
+        if self._context_window <= 0:
+            return
+        if self._context_window_warning_scheduled:
+            return
+        self._context_window_warning_scheduled = True
+        try:
+            asyncio.create_task(self._context_window_check_after_delay(1800))
+        except RuntimeError:
+            # No running loop yet (defensive — _process_inbound_message is
+            # always called from inside the loop in practice).
+            self._context_window_warning_scheduled = False
+
+    async def _context_window_check_after_delay(self, delay: int) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if not self._context_window_observed:
+            logger.warning(
+                "[Feishu] context_window=%d configured but no non-@ group "
+                "messages observed in %ds — verify the app holds the "
+                "im:message.group_msg scope, otherwise the pre-mention "
+                "buffer will stay empty.",
+                self._context_window, delay,
+            )
 
     # --- Group policy ---------------------------------------------------------
 

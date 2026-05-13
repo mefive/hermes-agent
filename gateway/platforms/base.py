@@ -947,6 +947,12 @@ class MessageEvent:
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
+
+    # Pre-mention conversation snippet. Populated by adapters that observe
+    # non-@ group messages (Feishu when the app holds im:message.group_msg) so
+    # the agent sees what was said before the user finally summoned the bot.
+    # Adapters format it; run.py injects it as a prompt prefix on the @ turn.
+    recent_context: Optional[str] = None
     
     # Auto-loaded skill(s) for topic/channel bindings (e.g., Telegram DM Topics,
     # Discord channel_skill_bindings).  A single name or ordered list.
