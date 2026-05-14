@@ -58,6 +58,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -551,6 +552,106 @@ def _strip_markdown_to_plain_text(text: str) -> str:
     plain = re.sub(r"<u>([\s\S]*?)</u>", r"\1", plain)
     plain = strip_markdown(plain)
     return plain
+
+
+# Match a markdown table separator row, e.g. `|---|:--:|---:|`.
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|[\-|: ]+\|\s*$")
+# Match any pipe-delimited table row (header, separator, or data).
+_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+
+
+def _display_width(text: str) -> int:
+    """Monospace column width. East-Asian Wide/Fullwidth count as 2 columns."""
+    width = 0
+    for ch in text:
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _split_table_row(line: str) -> List[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _render_table_as_code_block(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    col_count = max(len(r) for r in rows)
+    padded = [r + [""] * (col_count - len(r)) for r in rows]
+    col_widths = [max(_display_width(r[i]) for r in padded) for i in range(col_count)]
+
+    def pad_cell(cell: str, width: int) -> str:
+        return cell + " " * (width - _display_width(cell))
+
+    sep = "   "
+
+    def render_row(cells: List[str]) -> str:
+        return sep.join(pad_cell(cells[i], col_widths[i]) for i in range(col_count)).rstrip()
+
+    header_line = render_row(padded[0])
+    rule_line = sep.join("-" * col_widths[i] for i in range(col_count))
+    data_lines = [render_row(row) for row in padded[1:]]
+    body = "\n".join([header_line, rule_line, *data_lines])
+    return f"```\n{body}\n```"
+
+
+def _convert_markdown_tables_to_code_blocks(content: str) -> str:
+    """Replace each markdown table with a monospace-aligned fenced code block.
+
+    Tables inside existing fenced code blocks are left untouched. Non-table lines
+    are preserved verbatim. Designed for Feishu post `md` elements, which do not
+    render markdown tables but do render fenced code blocks in monospace.
+    """
+    if not content or "|" not in content:
+        return content
+
+    lines = content.split("\n")
+    out: List[str] = []
+    i = 0
+    in_code_block = False
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        is_fence = bool(
+            _MARKDOWN_FENCE_CLOSE_RE.match(stripped)
+            if in_code_block
+            else _MARKDOWN_FENCE_OPEN_RE.match(stripped)
+        )
+        if is_fence:
+            in_code_block = not in_code_block
+            out.append(line)
+            i += 1
+            continue
+        if (
+            not in_code_block
+            and i + 1 < len(lines)
+            and _TABLE_ROW_RE.match(line)
+            and not _TABLE_SEPARATOR_RE.match(line)
+            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            header_cells = _split_table_row(line)
+            j = i + 2
+            data_rows: List[List[str]] = []
+            while (
+                j < len(lines)
+                and _TABLE_ROW_RE.match(lines[j])
+                and not _TABLE_SEPARATOR_RE.match(lines[j])
+            ):
+                data_rows.append(_split_table_row(lines[j]))
+                j += 1
+            out.append(_render_table_as_code_block([header_cells, *data_rows]))
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
 
 
 def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -> Optional[int]:
