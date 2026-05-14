@@ -228,5 +228,47 @@ class TestConvertMarkdownTablesToCodeBlocks(unittest.TestCase):
         self.assertIn("```\nA   B\n-   -\n1   2\n```", result)
 
 
+class TestBuildOutboundPayloadRouting(unittest.TestCase):
+    """Tables now route to post-type (with converted code block), not text."""
+
+    def _adapter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        return FeishuAdapter(PlatformConfig())
+
+    def test_table_content_routes_to_post(self):
+        import json
+        content = textwrap.dedent(
+            """\
+            Report:
+
+            | A | B |
+            |---|---|
+            | 1 | 2 |
+            """
+        )
+        msg_type, payload = self._adapter()._build_outbound_payload(content)
+        self.assertEqual(msg_type, "post")
+        parsed = json.loads(payload)
+        rendered = "\n".join(
+            elem["text"] for row in parsed["zh_cn"]["content"] for elem in row
+        )
+        self.assertIn("```", rendered)
+        self.assertIn("A   B", rendered)
+        self.assertNotIn("|---|", rendered)
+
+    def test_plain_text_unaffected(self):
+        import json
+        msg_type, payload = self._adapter()._build_outbound_payload("just hello")
+        self.assertEqual(msg_type, "text")
+        self.assertEqual(json.loads(payload), {"text": "just hello"})
+
+    def test_pipes_without_table_stay_text(self):
+        import json
+        msg_type, payload = self._adapter()._build_outbound_payload("a | b without separator")
+        self.assertEqual(msg_type, "text")
+        self.assertEqual(json.loads(payload), {"text": "a | b without separator"})
+
+
 if __name__ == "__main__":
     unittest.main()
